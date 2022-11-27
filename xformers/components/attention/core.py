@@ -253,7 +253,7 @@ def scaled_dot_product_attention(
             q, k, v = q.float(), k.float(), v.float()
 
         att = scaled_query_key_softmax(q, k, att_mask=att_mask, causal=causal)
-
+        print(att)
         #  Optional dropout, could be part of the masking in the future
         att = _apply_dropout(att, dropout)
 

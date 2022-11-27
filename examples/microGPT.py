@@ -29,8 +29,8 @@ class GPT(pl.LightningModule):
         weight_decay=0.1,
         betas=(0.9, 0.95),
         learning_rate=6e-4,
-        n_embd=512,
-        block_size=128,
+        n_embd=64,
+        block_size=1,
         n_layer=4,
         n_head=4,
         resid_pdrop=0.1,
@@ -165,18 +165,29 @@ class GPT(pl.LightningModule):
         return logits
 
     def training_step(self, batch, _):
-        src, targets = batch
+        src, targets, loss_mask = batch
+        # print(src.shape, targets.shape, loss_mask.shape)
 
         # Update the tokens we've seen (tracked for LR scheduling)
         self._tokens_seen += (src >= 0).numel()
 
         # same action as inference
         logits = self(src)
+        # print(logits.shape)
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # print(logits.view(-1, logits.size(-1)).shape)
+            # print(targets.view(-1).shape)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none").view(
+                logits.shape[0], logits.shape[1]
+            )
+            # print(loss)
+            # print(loss.shape)
+            print(loss.mean())
+            loss = (loss * loss_mask).mean()
+            print(loss)
 
         self.logger.log_metrics(
             {
@@ -208,10 +219,18 @@ class CharDataset(Dataset):
         chunk = self.data[i : i + self.block_size + 1]
         dix = [self.stoi[s] for s in chunk]
 
+
+        # Toy Copy Task
+        # NOTE: block_size is a multiple of 2.
+        dix = 2 * dix[:self.block_size//2]
+
         # src and target are off by one, we want the model to predict the next word
         x = torch.tensor(dix[:-1], dtype=torch.long)
         y = torch.tensor(dix[1:], dtype=torch.long)
-        return x, y
+        # y = torch.tensor(dix[:-1], dtype=torch.long)
+        mask = torch.zeros(len(dix) - 1)
+        mask[(len(dix)//2 - 1):] = 1
+        return x, y, mask
 
     def to_tokens(self, message, device):
         return torch.tensor([self.stoi[s] for s in message], dtype=torch.long)[
@@ -271,10 +290,10 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
 if __name__ == "__main__":
     seed_everything(42)
     REF_BATCH = 512
-    BATCH = 64  # adjust depending on the avaiable memory on your machine
+    BATCH = 512  # adjust depending on the avaiable memory on your machine
     WORKERS = 8
-    EPOCHS = 1
-    BLOCK = 128
+    EPOCHS = 2
+    BLOCK = 32
     WARMUP = 20
 
     if not os.path.exists("input.txt"):
@@ -298,7 +317,7 @@ if __name__ == "__main__":
     model = GPT(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
-        attention="nystrom",
+        attention="scaled_dot_product",
         warmup_tokens=REF_BATCH * WARMUP,
         final_tokens=EPOCHS * len(train_dataset) * BLOCK,
     )
@@ -310,8 +329,9 @@ if __name__ == "__main__":
         precision=16,
         gradient_clip_val=1,
         log_every_n_steps=1,
-        terminate_on_nan=True,
+        # terminate_on_nan=True,
         accumulate_grad_batches=REF_BATCH // BATCH,
+        # accelerator="cpu"
     )
 
     trainer.fit(model, train_loader)
@@ -319,6 +339,6 @@ if __name__ == "__main__":
     # sample from the model
     context = "Friends of my soul"  # Prime with something
     x = train_dataset.to_tokens(context, model.device)
-    y = sample(model, x, steps=1000, temperature=1.0, sample=True, top_k=10)
+    y = sample(model, x, steps=1000, temperature=1.0, sample=True, top_k=1)
 
     print(train_dataset.from_tokens(y))
