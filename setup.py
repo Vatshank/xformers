@@ -8,7 +8,10 @@
 import datetime
 import distutils.command.clean
 import glob
+import importlib.util
+import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -25,7 +28,7 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
 )
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
+this_dir = os.path.dirname(__file__)
 
 
 def get_extra_nvcc_flags_for_build_type() -> List[str]:
@@ -128,7 +131,6 @@ def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
     if not nvcc_archs_flags:
         return []
 
-    this_dir = os.path.dirname(os.path.abspath(__file__))
     flash_root = os.path.join(this_dir, "third_party", "flash-attention")
     if not os.path.exists(flash_root):
         raise RuntimeError(
@@ -136,15 +138,11 @@ def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
             "to run `git submodule update --init --recursive` ?"
         )
 
-    nvcc_platform_dependant_args: List[str] = []
-    if sys.platform == "win32":
-        nvcc_platform_dependant_args.append("-std=c++17")
-
     return [
         CUDAExtension(
             name="xformers._C_flashattention",
             sources=[
-                os.path.join(this_dir, "third_party", "flash-attention", path)
+                os.path.join("third_party", "flash-attention", path)
                 for path in [
                     "csrc/flash_attn/fmha_api.cpp",
                     "csrc/flash_attn/src/fmha_fwd_hdim32.cu",
@@ -162,28 +160,29 @@ def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
                 "nvcc": extra_compile_args.get("nvcc", [])
                 + [
                     "-O3",
+                    "-std=c++17",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
                     "--ptxas-options=-v",
                 ]
-                + nvcc_platform_dependant_args
                 + nvcc_archs_flags
                 + get_extra_nvcc_flags_for_build_type(),
             },
             include_dirs=[
-                Path(flash_root) / "csrc" / "flash_attn",
-                Path(flash_root) / "csrc" / "flash_attn" / "src",
-                #            Path(flash_root) / 'csrc' / 'flash_attn' / 'cutlass' / 'include',
-                Path(this_dir) / "third_party" / "cutlass" / "include",
+                p.absolute()
+                for p in [
+                    Path(flash_root) / "csrc" / "flash_attn",
+                    Path(flash_root) / "csrc" / "flash_attn" / "src",
+                    Path(this_dir) / "third_party" / "cutlass" / "include",
+                ]
             ],
         )
     ]
 
 
 def get_extensions():
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    extensions_dir = os.path.join(this_dir, "xformers", "csrc")
+    extensions_dir = os.path.join("xformers", "csrc")
 
     sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
     source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
@@ -211,6 +210,7 @@ def get_extensions():
 
     include_dirs = [extensions_dir]
     ext_modules = []
+    cuda_version = None
 
     if (
         (torch.cuda.is_available() and ((CUDA_HOME is not None)))
@@ -226,6 +226,7 @@ def get_extensions():
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "--extended-lambda",
+            "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
         ] + get_extra_nvcc_flags_for_build_type()
         if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
             nvcc_flags.append("-DNDEBUG")
@@ -251,19 +252,33 @@ def get_extensions():
             cuda_version=cuda_version, extra_compile_args=extra_compile_args
         )
 
-    sources = [os.path.join(extensions_dir, s) for s in sources]
-
     ext_modules.append(
         extension(
             "xformers._C",
             sorted(sources),
-            include_dirs=include_dirs,
+            include_dirs=[os.path.abspath(p) for p in include_dirs],
             define_macros=define_macros,
             extra_compile_args=extra_compile_args,
         )
     )
 
-    return ext_modules
+    return ext_modules, {
+        "version": {
+            "cuda": cuda_version,
+            "torch": torch.__version__,
+            "python": platform.python_version(),
+        },
+        "env": {
+            k: os.environ.get(k)
+            for k in [
+                "TORCH_CUDA_ARCH_LIST",
+                "XFORMERS_BUILD_TYPE",
+                "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
+                "NVCC_FLAGS",
+                "XFORMERS_PACKAGE_FROM",
+            ]
+        },
+    }
 
 
 class clean(distutils.command.clean.clean):  # type: ignore
@@ -282,16 +297,50 @@ class clean(distutils.command.clean.clean):  # type: ignore
         distutils.command.clean.clean.run(self)
 
 
+class BuildExtensionWithMetadata(BuildExtension):
+    def __init__(self, *args, **kwargs) -> None:
+        self.xformers_build_metadata = kwargs.pop("xformers_build_metadata")
+        self.pkg_name = "xformers"
+        self.metadata_json = "cpp_lib.json"
+        super().__init__(*args, **kwargs)
+
+    def build_extensions(self) -> None:
+        super().build_extensions()
+        with open(
+            os.path.join(self.build_lib, self.pkg_name, self.metadata_json), "w+"
+        ) as fp:
+            json.dump(self.xformers_build_metadata, fp)
+
+    def copy_extensions_to_source(self):
+        """
+        Used for `pip install -e .`
+        Copies everything we built back into the source repo
+        """
+        build_py = self.get_finalized_command("build_py")
+        package_dir = build_py.get_package_dir(self.pkg_name)
+        inplace_file = os.path.join(package_dir, self.metadata_json)
+        regular_file = os.path.join(self.build_lib, self.pkg_name, self.metadata_json)
+        self.copy_file(regular_file, inplace_file, level=self.verbose)
+        super().copy_extensions_to_source()
+
+
 if __name__ == "__main__":
 
     try:
         # when installing as a source distribution, the version module should exist
-        from xformers.version import __version__
-
-        version = __version__
-    except ModuleNotFoundError:
+        # Let's import it manually to not trigger the load of the C++
+        # library - which does not exist yet, and creates a WARNING
+        spec = importlib.util.spec_from_file_location(
+            "xformers_version", os.path.join(this_dir, "xformers", "version.py")
+        )
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError()
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        version = module.__version__
+    except FileNotFoundError:
         if os.getenv("BUILD_VERSION"):  # In CI
-            version = os.getenv("BUILD_VERSION")
+            version = os.getenv("BUILD_VERSION", "0.0.0")
         else:
             version_txt = os.path.join(this_dir, "version.txt")
             with open(version_txt) as f:
@@ -310,6 +359,7 @@ if __name__ == "__main__":
         Path("third_party") / "flash-attention" / "flash_attn",
         is_building_wheel,
     )
+    extensions, extensions_metadata = get_extensions()
     setuptools.setup(
         name="xformers",
         description="XFormers: A collection of composable Transformer building blocks.",
@@ -318,9 +368,11 @@ if __name__ == "__main__":
         packages=setuptools.find_packages(
             exclude=("tests*", "benchmarks*", "experimental*")
         ),
-        ext_modules=get_extensions(),
+        ext_modules=extensions,
         cmdclass={
-            "build_ext": BuildExtension.with_options(no_python_abi_suffix=True),
+            "build_ext": BuildExtensionWithMetadata.with_options(
+                no_python_abi_suffix=True, xformers_build_metadata=extensions_metadata
+            ),
             "clean": clean,
         },
         url="https://facebookresearch.github.io/xformers/",

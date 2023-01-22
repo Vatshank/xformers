@@ -9,71 +9,30 @@ from typing import Any, List, Mapping, Optional, Set, Tuple, Type, Union
 
 import torch
 
-from .tensor_with_seqlen import TensorWithSeqLen
+from ..._cpp_lib import _built_with_cuda
+from ..common import BaseOperator
+from .attn_bias import AttentionBias, BlockDiagonalMask, LowerTriangularMask
 
 
-class AttentionMask:
-    """Base class for custom masks that can be applied \
-        in :attr:`xformers.ops.memory_efficient_attention`.
-
-    When using an :attr:`xformers.ops.AttentionMask`
-    instead of a :attr:`torch.Tensor`, the mask matrix does
-    not need to be materialized, and can be
-    hardcoded into some kernels for better performance.
-
-    See also :attr:`xformers.ops.LowerTriangularMask`
-    """
-
-    def to_tensor(self) -> torch.Tensor:
-        """Materializes the mask tensor
-
-        Returns:
-            torch.Tensor
-        """
-        raise NotImplementedError()
-
-
-class LowerTriangularMask(AttentionMask):
-    """A lower triangular mask that can be used for causal attention"""
-
-    def __init__(self, *tensor_args, **tensor_kwargs) -> None:
-        """Creates a Lower triangular mask.
-        It is not requires to specify any parameter, as they are only \
-            used when calling :attr:`LowerTriangularMask.to_tensor`
-
-        The mask will not be materialized by default, and hence does not use \
-            any additional memory, but acts as an option for the MHA kernel.
-        """
-        self._tensor: Optional[torch.Tensor] = None
-        self._tensor_kwargs = tensor_kwargs
-        self._tensor_args = tensor_args
-
-    def to_tensor(self) -> torch.Tensor:
-        """Materializes the mask tensor
-
-        Returns:
-            torch.Tensor
-        """
-        if self._tensor is None:
-            # Work around for "triu_tril_cuda_template" not implemented for 'BFloat16'
-            dtype = self._tensor_kwargs.pop("dtype", torch.float)
-            create_as = dtype if dtype is not torch.bfloat16 else torch.float32
-            self._tensor = torch.full(  # type: ignore
-                *self._tensor_args,
-                **self._tensor_kwargs,
-                dtype=create_as,
-                fill_value=float("-inf"),
-            )
-            self._tensor = torch.triu(self._tensor, diagonal=1).to(dtype)  # type: ignore
-        return self._tensor
+def _is_bias_type_supported_in_BMK(attn_bias_type: Any) -> bool:
+    # NoneType
+    if isinstance(None, attn_bias_type):
+        return True
+    if attn_bias_type in [LowerTriangularMask, torch.Tensor]:
+        return True
+    return False
 
 
 @dataclass
 class Inputs:
+    """
+    Stores inputs to the `memory_efficient_attention` operators
+    """
+
     query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
-    attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None
     p: float = 0.0
     scale: Optional[float] = None
 
@@ -117,18 +76,20 @@ class Inputs:
                 f"  key.dtype  : {self.key.dtype}\n"
                 f"  value.dtype: {self.value.dtype}"
             )
-        has_seqlen = any(isinstance(x, TensorWithSeqLen) for x in qkv)
-        if has_seqlen:
-            if not all(isinstance(x, TensorWithSeqLen) for x in qkv):
-                raise ValueError(
-                    f"One of Query/Key/Value has sequence length information, but not all of them\n"
-                    f"  type(query): {type(self.query)}\n"
-                    f"  type(key)  : {type(self.key)}\n"
-                    f"  type(value): {type(self.value)}"
-                )
+        # Biases with tensors attached are meant to be in BMHK format
+        # This would require to permute biases/gradients which can be expensive,
+        # so let's just forbid it - BMK is a legacy format anyway
+        if self.query.ndim == 3 and not _is_bias_type_supported_in_BMK(
+            type(self.attn_bias)
+        ):
+            raise ValueError(
+                f"Please provide inputs in BMHK format rather "
+                f"than BMK when using bias type `{type(self.attn_bias).__name__}`"
+            )
+        if isinstance(self.attn_bias, BlockDiagonalMask):
             if any(x.shape[0] != 1 for x in qkv):
                 raise ValueError(
-                    f"Expected batch_size=1 when using sequence length information\n"
+                    f"Expected batch_size=1 when using block-diagonal bias\n"
                     f"  query.shape: {self.query.shape}\n"
                     f"  key.shape  : {self.key.shape}\n"
                     f"  value.shape: {self.value.shape}"
@@ -162,9 +123,11 @@ class Gradients:
     dq: torch.Tensor
     dk: torch.Tensor
     dv: torch.Tensor
+    # bias gradient. None if there is no tensor bias or if it doesn't require grad
+    db: Optional[torch.Tensor] = None
 
 
-class AttentionOpBase:
+class AttentionOpBase(BaseOperator):
     """Base class for any attention operator in xFormers
 
     See:
@@ -180,13 +143,13 @@ class AttentionOpBase:
 
     OPERATOR: Any
     SUPPORTED_DEVICES: Set[str]
+    CUDA_MINIMUM_COMPUTE_CAPABILITY: Tuple[int, int] = (5, 0)
     SUPPORTED_DTYPES: Set[torch.dtype]
     SUPPORTED_MAX_K: float
     SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {type(None)}
     SUPPORTS_DROPOUT: bool
     SUPPORTS_CUSTOM_SCALE: bool = False
     SUPPORTS_DIFFERENT_VALUE_EMBED: bool = False
-    SUPPORTS_TENSOR_WITH_SEQLEN: bool = False
     NAME: str
     OPERATOR_CATEGORY = "memory_efficient_attention"
 
@@ -194,38 +157,39 @@ class AttentionOpBase:
     _TEST_K: List[int] = [32, 128]
 
     @classmethod
-    def info(cls):
-        if cls.OPERATOR is None or cls.OPERATOR.__name__ == "no_such_operator":
-            return "unavailable"
-        return "available"
+    def supports(cls, d: Inputs) -> bool:
+        return not cls.not_supported_reasons(d)
 
     @classmethod
-    def supports(cls, d: Inputs) -> bool:
+    def not_supported_reasons(cls, d: Inputs) -> List[str]:
+        """
+        Returns a list of reasons why this is not supported.
+        The kernel can run these inputs only if the returned list is empty
+        """
+        reasons = []
         device_type = d.query.device.type
         dtype = d.query.dtype
-        if not cls.SUPPORTS_TENSOR_WITH_SEQLEN and (
-            isinstance(d.query, TensorWithSeqLen)
-            or isinstance(d.key, TensorWithSeqLen)
-            or isinstance(d.value, TensorWithSeqLen)
-        ):
-            return False
         if device_type not in cls.SUPPORTED_DEVICES:
-            return False
+            reasons.append(f"device={device_type} (supported: {cls.SUPPORTED_DEVICES})")
+        if device_type == "cuda" and not _built_with_cuda:
+            reasons.append("xFormers wasn't build with CUDA support")
         if dtype not in cls.SUPPORTED_DTYPES:
-            return False
+            reasons.append(f"dtype={dtype} (supported: {cls.SUPPORTED_DTYPES})")
         if (
             not cls.SUPPORTS_DIFFERENT_VALUE_EMBED
             and d.query.shape[-1] != d.value.shape[-1]
         ):
-            return False
+            reasons.append("query.shape[-1] != value.shape[-1]")
         if max(d.query.shape[-1], d.value.shape[-1]) > cls.SUPPORTED_MAX_K:
-            return False
+            reasons.append(
+                f"max(query.shape[-1] != value.shape[-1]) > {cls.SUPPORTED_MAX_K}"
+            )
         if type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES:
-            return False
+            reasons.append(f"attn_bias type is {type(d.attn_bias)}")
         if (d.p != 0.0) and not cls.SUPPORTS_DROPOUT:
-            return False
+            reasons.append("dropout > 0.0")
         if d.scale is not None and not cls.SUPPORTS_CUSTOM_SCALE:
-            return False
+            reasons.append("has custom scale")
         # bfloat16 is only supported on A100+
         # ... although the kernels can still run and give the
         # correct result
@@ -233,8 +197,8 @@ class AttentionOpBase:
             not device_type.startswith("cuda")
             or torch.cuda.get_device_capability(d.query.device)[0] < 8
         ):
-            return False
-        return True
+            reasons.append("bf16 is only supported on A100+ GPUs")
+        return reasons
 
 
 class AttentionFwOpBase(AttentionOpBase):
@@ -267,6 +231,20 @@ class AttentionBwOpBase(AttentionOpBase):
         torch.half: 2e-2,
         torch.bfloat16: 0.1,
     }
+    SUPPORTS_ATTN_BIAS_GRAD = False
+
+    @classmethod
+    def supports(cls, d: Inputs) -> bool:
+        if not super(AttentionBwOpBase, cls).supports(d):
+            return False
+        if (
+            isinstance(d.attn_bias, torch.Tensor)
+            and d.attn_bias.requires_grad
+            and not cls.SUPPORTS_ATTN_BIAS_GRAD
+        ):
+            return False
+
+        return True
 
     @classmethod
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
@@ -296,7 +274,7 @@ class AttentionOpDispatch:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+        attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
         p: float = 0.0,
         scale: Optional[float] = None,
     ) -> "AttentionOpDispatch":
@@ -320,3 +298,19 @@ def bmk2bmhk(tensor, num_heads: int) -> torch.Tensor:
     return tensor.reshape([-1, num_heads, tensor.shape[1], tensor.shape[2]]).permute(
         (0, 2, 1, 3)
     )
+
+
+def check_lastdim_alignment_stride1(
+    reasons: List[str], name: str, x: torch.Tensor, alignment: int
+) -> None:
+    if x.shape[-1] % alignment != 0:
+        reasons.append(f"{name}.shape[-1] % {alignment} != 0")
+    elif x.stride(-2) % alignment != 0:
+        reasons.append(
+            f"{name}.stride(-2) % {alignment} != 0 ({name}.stride() = {x.stride()})"
+        )
+    # We can have stride=0 sometimes if dimension=1
+    if x.stride(-1) > 1:
+        reasons.append(
+            f"{name}.stride(-1) > 1 ({name}.stride() = {x.stride()}) - you should call `.contiguous()` on the input"
+        )

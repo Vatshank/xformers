@@ -11,6 +11,9 @@
 build/
 dist/
 
+# for autocomplete
+compile_commands.json
+
 # Pytest verbose output
 test-results/
 
@@ -55,3 +58,5 @@ outputs
 
 .benchmarks
 xformers/_flash_attn
+xformers/version.py
+xformers/cpp_lib.json

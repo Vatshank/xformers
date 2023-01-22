@@ -5,20 +5,20 @@
 
 
 from dataclasses import replace
-from typing import Any, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
 
 from ..common import get_operator, register_operator
+from .attn_bias import BlockDiagonalCausalMask, BlockDiagonalMask, LowerTriangularMask
 from .common import (
     AttentionBwOpBase,
     AttentionFwOpBase,
     Context,
     Gradients,
     Inputs,
-    LowerTriangularMask,
+    check_lastdim_alignment_stride1,
 )
-from .tensor_with_seqlen import TensorWithSeqLen
 
 try:
     from ... import _C_flashattention  # type: ignore[attr-defined]
@@ -133,12 +133,19 @@ def _convert_input_format(
     head_dim_q = query.shape[3]
     head_dim_v = value.shape[3]
 
-    assert isinstance(inp.key, TensorWithSeqLen) == isinstance(
-        inp.value, TensorWithSeqLen
-    ), "Both key/value should have seqlen information, or none of them"
-    if isinstance(inp.key, TensorWithSeqLen):
-        cu_seqlen_k = inp.key.cu_seqlen
-        max_seqlen_k = inp.key.max_seqlen
+    attn_bias = inp.attn_bias
+    if isinstance(attn_bias, BlockDiagonalMask):
+        attn_bias.k_seqinfo.cu_seqlen = attn_bias.k_seqinfo.cu_seqlen.to(
+            inp.query.device, non_blocking=True
+        )
+        attn_bias.q_seqinfo.cu_seqlen = attn_bias.q_seqinfo.cu_seqlen.to(
+            inp.query.device, non_blocking=True
+        )
+
+        cu_seqlen_k = attn_bias.k_seqinfo.cu_seqlen
+        cu_seqlen_q = attn_bias.q_seqinfo.cu_seqlen
+        max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
+        max_seqlen_k = attn_bias.k_seqinfo.max_seqlen
     else:
         cu_seqlen_k = torch.arange(
             0,
@@ -147,13 +154,7 @@ def _convert_input_format(
             dtype=torch.int32,
             device=query.device,
         )
-        max_seqlen_k = seqlen_kv
-
-    if isinstance(inp.query, TensorWithSeqLen):
-        cu_seqlen_q = inp.query.cu_seqlen
-        max_seqlen_q = inp.query.max_seqlen
-    else:
-        if not isinstance(inp.key, TensorWithSeqLen) and seqlen_q == seqlen_kv:
+        if seqlen_q == seqlen_kv:
             cu_seqlen_q = cu_seqlen_k
         else:
             cu_seqlen_q = torch.arange(
@@ -164,6 +165,7 @@ def _convert_input_format(
                 device=query.device,
             )
         max_seqlen_q = seqlen_q
+        max_seqlen_k = seqlen_kv
 
     # Initially we have `query.shape = [batch, seqlen, head_dim_q]`
     # We want format `[batch * seqlen, num_heads, head_dim_q]`
@@ -191,36 +193,34 @@ class FwOp(AttentionFwOpBase):
 
     OPERATOR = get_operator("xformers_flash", "flash_fwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
+    CUDA_MINIMUM_COMPUTE_CAPABILITY = (7, 5)
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     SUPPORTED_MAX_K = 128
-    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {type(None), LowerTriangularMask}
+    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {
+        type(None),
+        LowerTriangularMask,
+        BlockDiagonalMask,
+        BlockDiagonalCausalMask,
+    }
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
-    SUPPORTS_TENSOR_WITH_SEQLEN = True
     NAME = "flshattF"
 
     @classmethod
-    def supports(cls, d: "Inputs") -> bool:
-        if not super(FwOp, cls).supports(d):
-            return False
-        # We know `d.device` is cuda now
-        # d=128 is only supported on A100 for bw
-        # d > 64 is only supported on A100 for bw
-        device_capability = torch.cuda.get_device_capability(d.device)
-        if (d.query.shape[-1] % 8) > 0:
-            return False
-        return device_capability >= (7, 5)
+    def not_supported_reasons(cls, d: Inputs) -> List[str]:
+        reasons = super(FwOp, cls).not_supported_reasons(d)
+        check_lastdim_alignment_stride1(reasons, "query", d.query, 8)
+        if d.device.type == "cuda":
+            device_capability = torch.cuda.get_device_capability(d.device)
+            if device_capability < (7, 5):
+                reasons.append("requires a GPU with compute capability > 7.5")
+        return reasons
 
     @classmethod
     def apply(
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
-        if inp.attn_bias is not None and not isinstance(
-            inp.attn_bias, LowerTriangularMask
-        ):
-            raise NotImplementedError("Unsupported attn_bias type")
-        causal = isinstance(inp.attn_bias, LowerTriangularMask)
         return_softmax = False
         out_shape = [
             inp.query.shape[0],
@@ -247,7 +247,7 @@ class FwOp(AttentionFwOpBase):
             max_seqlen_k,
             inp.p,
             softmax_scale,
-            causal,
+            isinstance(inp.attn_bias, (LowerTriangularMask, BlockDiagonalCausalMask)),
             return_softmax,
         )
 
@@ -263,24 +263,32 @@ class FwOp(AttentionFwOpBase):
 class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("xformers_flash", "flash_bwd")
     SUPPORTED_DEVICES = FwOp.SUPPORTED_DEVICES
+    CUDA_MINIMUM_COMPUTE_CAPABILITY = FwOp.CUDA_MINIMUM_COMPUTE_CAPABILITY
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
     SUPPORTED_ATTN_BIAS_TYPES = FwOp.SUPPORTED_ATTN_BIAS_TYPES
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
-    SUPPORTS_TENSOR_WITH_SEQLEN = FwOp.SUPPORTS_TENSOR_WITH_SEQLEN
     NAME = "flshattB"
 
     @classmethod
-    def supports(cls, d: Inputs) -> bool:
-        if not FwOp.supports(d):
-            return False
-        device_capability = torch.cuda.get_device_capability(d.device)
-        is_sm80 = device_capability[0] == 8 and device_capability[1] == 0
-        if max(d.key.shape[-1], d.query.shape[-1]) > 64 and not is_sm80:
-            return False
-        return True
+    def not_supported_reasons(cls, d: Inputs) -> List[str]:
+        reasons = super(BwOp, cls).not_supported_reasons(d)
+        check_lastdim_alignment_stride1(reasons, "query", d.query, 8)
+        if d.device.type == "cuda":
+            # We know `d.device` is cuda now
+            # d=128 is only supported on A100 for bw
+            # d > 64 is only supported on A100 for bw
+            device_capability = torch.cuda.get_device_capability(d.device)
+            if device_capability < (7, 5):
+                reasons.append("requires a GPU with compute capability > 7.5")
+            is_sm80 = device_capability[0] == 8 and device_capability[1] == 0
+            if max(d.key.shape[-1], d.query.shape[-1]) > 64 and not is_sm80:
+                reasons.append(
+                    "requires a GPU with compute capability == 8.0 for 'query.shape[-1] > 64'"
+                )
+        return reasons
 
     @classmethod
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
@@ -352,7 +360,7 @@ class BwOp(AttentionBwOpBase):
             max_seqlen_k,
             inp.p,
             softmax_scale,
-            isinstance(inp.attn_bias, LowerTriangularMask),
+            isinstance(inp.attn_bias, (LowerTriangularMask, BlockDiagonalCausalMask)),
         )
         if cur_rng_state is not None:
             torch.cuda.set_rng_state(cur_rng_state)

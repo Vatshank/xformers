@@ -8,21 +8,19 @@ from typing import Any, Optional, Tuple, Type, Union
 import torch
 
 from . import cutlass, flash, small_k, triton
+from .attn_bias import AttentionBias, BlockDiagonalMask, LowerTriangularMask
 from .common import (
     AttentionBwOpBase,
     AttentionFwOpBase,
-    AttentionMask,
     AttentionOp,
     AttentionOpBase,
     AttentionOpDispatch,
     Context,
     Gradients,
     Inputs,
-    LowerTriangularMask,
     bmk2bmhk,
 )
-from .dispatch import _dispatch_bw, _dispatch_fw
-from .tensor_with_seqlen import TensorWithSeqLen  # noqa
+from .dispatch import _dispatch_bw, _dispatch_fw, _ensure_op_supports_or_raise
 
 MemoryEfficientAttentionCutlassOp = (cutlass.FwOp, cutlass.BwOp)
 MemoryEfficientAttentionCutlassFwdFlashBwOp = (cutlass.FwOp, flash.BwOp)
@@ -72,6 +70,7 @@ class _fMHA(torch.autograd.Function):
         ctx.op_fw = op_fw
         ctx.op_bw = op_bw
         ctx.p = inp.p
+
         ctx.scale = inp.scale
         ctx.attn_bias_ctx = attn_bias_ctx
         ctx.n_args = len(args)
@@ -88,13 +87,6 @@ class _fMHA(torch.autograd.Function):
     @classmethod
     @torch.autograd.function.once_differentiable
     def backward(cls, ctx, grad):
-        assert all(
-            not ctx.needs_input_grad[i] for i in range(ctx.n_args) if i not in [1, 2, 3]
-        ), (
-            "Only gradients to Q/K/V is implemented. "
-            "For instance, it's not possible to backpropagate through the attention mask"
-        )
-
         # Re-create context
         query, key, value, out, lse = ctx.saved_tensors
         attn_bias_tensor = ctx.attn_bias_tensor
@@ -107,18 +99,24 @@ class _fMHA(torch.autograd.Function):
             p=ctx.p,
             scale=ctx.scale,
         )
-        op_ctx = Context(lse=lse, out=out, rng_state=rng_state)
+        op_ctx = Context(
+            lse=lse,
+            out=out,
+            rng_state=rng_state,
+        )
         grads = _memory_efficient_attention_backward(
             ctx=op_ctx, inp=inp, grad=grad, op=ctx.op_bw
         )
-        return (None, grads.dq, grads.dk, grads.dv) + (None,) * (ctx.n_args - 3)
+        return (None, grads.dq, grads.dk, grads.dv, grads.db) + (None,) * (
+            ctx.n_args - 2
+        )
 
 
 def memory_efficient_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -172,6 +170,10 @@ def memory_efficient_attention(
 
         NVIDIA GPUs with compute capability above 6.0 (P100+), datatype ``f16``, ``bf16`` and ``f32``.
 
+    :Note:
+
+        This operator may be nondeterministic.
+
     Raises:
         NotImplementedError: if there is no operator available to compute the MHA
 
@@ -202,7 +204,7 @@ def memory_efficient_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -221,7 +223,7 @@ def memory_efficient_attention_forward_requires_grad(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -253,7 +255,7 @@ def memory_efficient_attention_backward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -261,7 +263,7 @@ def memory_efficient_attention_backward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the gradient of the attention.
-    Returns a tuple (dq, dk, dv)
+    Returns a tuple (dq, dk, dv, db)
     See :attr:`xformers.ops.memory_efficient` for an explanation of the arguments.
     `lse` is the tensor returned by :attr:`xformers.ops.memory_efficient_attention_forward_requires_grad`
     """
@@ -303,10 +305,8 @@ def _memory_efficient_attention_forward(
     output_shape = inp.normalize_bmhk()
     if op is None:
         op = _dispatch_fw(inp)
-    elif not op.supports(inp):
-        raise ValueError(
-            f"xformers.memory_efficient_attention: Operator {op.NAME} does not support this input"
-        )
+    else:
+        _ensure_op_supports_or_raise(ValueError, "memory_efficient_attention", op, inp)
 
     out, *_ = op.apply(inp, needs_gradient=False)
     return out.reshape(output_shape)
@@ -319,10 +319,8 @@ def _memory_efficient_attention_forward_requires_grad(
     output_shape = inp.normalize_bmhk()
     if op is None:
         op = _dispatch_fw(inp)
-    elif not op.supports(inp):
-        raise ValueError(
-            f"xformers.memory_efficient_attention: Operator {op.NAME} does not support this input"
-        )
+    else:
+        _ensure_op_supports_or_raise(ValueError, "memory_efficient_attention", op, inp)
     out = op.apply(inp, needs_gradient=True)
     assert out[1] is not None
     return (out[0].reshape(output_shape), out[1])
@@ -349,18 +347,18 @@ def _memory_efficient_attention_backward(
         ctx.lse.ndim != 3
         # Dim 0
         or (
-            not isinstance(inp.query, TensorWithSeqLen)
+            not isinstance(inp.attn_bias, BlockDiagonalMask)
             and ctx.lse.shape[0] != inp.query.shape[0]
         )
         or (
-            isinstance(inp.query, TensorWithSeqLen)
-            and ctx.lse.shape[0] != inp.query.cu_seqlen.shape[0] - 1
+            isinstance(inp.attn_bias, BlockDiagonalMask)
+            and ctx.lse.shape[0] != inp.attn_bias.q_seqinfo.cu_seqlen.shape[0] - 1
         )
         # Dim 1
         or ctx.lse.shape[1] != inp.query.shape[2]
         # Dim 2
         or (
-            not isinstance(inp.query, TensorWithSeqLen)
+            not isinstance(inp.attn_bias, BlockDiagonalMask)
             and ctx.lse.shape[2] < inp.query.shape[1]
         )
     ):
@@ -374,10 +372,11 @@ def _memory_efficient_attention_backward(
 
     if op is None:
         op = _dispatch_bw(inp)
-    elif not op.supports(inp):
-        raise ValueError(
-            f"xformers.memory_efficient_attention: Operator {op.NAME} does not support this input"
+    else:
+        _ensure_op_supports_or_raise(
+            ValueError, "memory_efficient_attention_backward", op, inp
         )
+
     grads = op.apply(ctx, inp, grad)
     grads.dq = grads.dq.reshape(shape_dq)
     grads.dk = grads.dk.reshape(shape_dk)
@@ -386,7 +385,7 @@ def _memory_efficient_attention_backward(
 
 
 __all__ = [
-    "AttentionMask",
+    "AttentionBias",
     "AttentionOp",
     "AttentionOpBase",
     "AttentionOpDispatch",
